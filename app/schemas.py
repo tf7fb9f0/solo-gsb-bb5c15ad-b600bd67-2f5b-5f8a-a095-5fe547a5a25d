@@ -119,6 +119,9 @@ class Conflict(BaseModel):
     location: Optional[str] = None
     requested: Optional[float] = None
     available: Optional[float] = None
+    current_location: Optional[str] = Field(
+        default=None, description="位置交接冲突时样品的数据库当前实际位置"
+    )
     cycle_path: Optional[list[str]] = Field(default=None, description="检测到的环路节点路径")
 
 
@@ -409,3 +412,72 @@ class StocktakeResponse(BaseModel):
     created_at: Optional[str] = None
     submitted_at: Optional[str] = None
     confirmed_at: Optional[str] = None
+
+
+# ---------------------------------------------------------------- 位置交接
+
+class HandoverItemIn(BaseModel):
+    """交接明细:声明样品当前所在原位置,校验一致后移到目标位置。"""
+
+    sample_id: str = Field(min_length=1)
+    from_location: Optional[str] = Field(
+        default=None,
+        description="请求方认为的样品当前位置,须与数据库当前位置一致;"
+                    "null 表示样品当前无位置",
+    )
+    to_location: str = Field(min_length=1, description="交接目标位置")
+
+
+class HandoverRequest(BaseModel):
+    """一次提交多个样品的位置交接:全部样品仍处于各自原位置才统一更新。"""
+
+    handover_no: str = Field(min_length=1, description="交接单号(幂等键),全局唯一")
+    operator: str = Field(min_length=1, description="交接人(审计必填)")
+    items: list[HandoverItemIn] = Field(min_length=1)
+    note: Optional[str] = Field(default=None, description="备注,仅用于审计展示")
+
+    @model_validator(mode="after")
+    def _check_items(self) -> "HandoverRequest":
+        ids = [i.sample_id for i in self.items]
+        if len(ids) != len(set(ids)):
+            raise ValueError("items 中存在重复 sample_id")
+        return self
+
+
+class HandoverItemOut(BaseModel):
+    sample_id: str
+    from_location: Optional[str] = Field(description="变更前位置")
+    to_location: str = Field(description="变更后位置")
+
+
+class HandoverResult(BaseModel):
+    handover_no: str
+    operator: str
+    note: Optional[str] = None
+    items: list[HandoverItemOut]
+    replayed: bool = Field(
+        default=False, description="True 表示命中交接单号幂等,返回首次结果"
+    )
+    created_at: Optional[str] = None
+
+
+class HandoverHistoryItem(BaseModel):
+    """按样品查询交接历史时的单条记录(一次交接中的该样品明细)。"""
+
+    handover_no: str
+    operator: str
+    note: Optional[str] = None
+    sample_id: str
+    from_location: Optional[str] = Field(description="变更前位置")
+    to_location: str = Field(description="变更后位置")
+    seq_index: int = Field(description="该样品在交接单内从 0 开始的下标")
+    created_at: str = Field(description="交接时间(UTC,ISO 8601)")
+
+
+class HandoverHistoryResponse(BaseModel):
+    sample_id: str
+    current_location: Optional[str] = Field(description="样品查询时刻的当前位置")
+    total: int
+    items: list[HandoverHistoryItem] = Field(
+        description="按交接时间先后排列的完整位置变更历史(变更前后位置)"
+    )

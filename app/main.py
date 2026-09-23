@@ -10,6 +10,7 @@ from fastapi import Depends, FastAPI, Query
 from fastapi.responses import JSONResponse
 
 from . import schemas as s
+from . import handovers as ho
 from . import reservations as rsv
 from . import service
 from . import stocktakes as st
@@ -45,9 +46,14 @@ app = FastAPI(
         "- 盘点模块:按样品编号集合建批保存余量/版本快照,\n"
         "  提交实盘时乐观锁校验余量未被改变并计算差异,\n"
         "  确认时单事务二次校验版本、写盘点调整流水并更新余量\n"
-        "  (任一项冲突整批不改库存),按批次号幂等重放"
+        "  (任一项冲突整批不改库存),按批次号幂等重放\n"
+        "- 位置交接模块:一次提交多个样品的原位置与目标位置,\n"
+        "  单事务校验全部样品仍处于请求所述原位置,\n"
+        "  任一不符则整批不变,全部通过后统一更新位置,\n"
+        "  并记录交接人、交接时间与变更前后位置(不可变审计),\n"
+        "  按交接单号幂等重放,并可按样品查询完整交接历史"
     ),
-    version="1.1.0",
+    version="1.2.0",
     lifespan=lifespan,
 )
 
@@ -88,6 +94,21 @@ async def stocktake_error_handler(
         status_code=status_code,
         content={
             "error": "stocktake_not_found" if status_code == 404 else "conflict",
+            "conflicts": [c.model_dump() for c in exc.conflicts],
+        },
+    )
+
+
+@app.exception_handler(ho.HandoverError)
+async def handover_error_handler(
+    _request, exc: ho.HandoverError
+) -> JSONResponse:
+    code = exc.conflicts[0].code if exc.conflicts else "handover_error"
+    status_code = 404 if code == "handover_not_found" else 409
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "error": "handover_not_found" if status_code == 404 else "conflict",
             "conflicts": [c.model_dump() for c in exc.conflicts],
         },
     )
@@ -475,3 +496,45 @@ def get_stocktake(
     conn: sqlite3.Connection = Depends(get_conn),
 ) -> s.StocktakeResponse:
     return st.get_stocktake(conn, stocktake_no)
+
+
+# ---------------------------------------------------------------- 位置交接
+
+@app.post(
+    "/api/v1/handovers",
+    response_model=s.HandoverResult,
+    tags=["位置交接"],
+    summary="位置交接:一次提交多个样品的原位置与目标位置,"
+            "单事务校验全部样品仍处于原位置,任一不符则整批不变",
+)
+def create_handover(
+    body: s.HandoverRequest,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> s.HandoverResult:
+    return ho.create_handover(conn, body)
+
+
+@app.get(
+    "/api/v1/handovers/{handover_no}",
+    response_model=s.HandoverResult,
+    tags=["位置交接"],
+    summary="按交接单号查询交接结果(幂等凭证)",
+)
+def get_handover(
+    handover_no: str,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> s.HandoverResult:
+    return ho.get_handover(conn, handover_no)
+
+
+@app.get(
+    "/api/v1/samples/{sample_id}/handovers",
+    response_model=s.HandoverHistoryResponse,
+    tags=["位置交接"],
+    summary="按样品查询位置交接历史:交接人、交接时间与变更前后位置",
+)
+def get_sample_handovers(
+    sample_id: str,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> s.HandoverHistoryResponse:
+    return ho.get_sample_history(conn, sample_id)

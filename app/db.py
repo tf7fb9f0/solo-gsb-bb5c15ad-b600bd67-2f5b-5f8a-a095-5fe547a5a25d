@@ -210,6 +210,45 @@ BEFORE DELETE ON dispose_records
 BEGIN
     SELECT RAISE(ABORT, 'dispose_records 不可变:禁止删除销毁审计记录');
 END;
+
+-- 位置交接单:一次提交多个样品的原位置与目标位置,记录交接人;
+-- handover_no 全局唯一,是幂等键。单事务内全部样品仍处于各自原位置才统一更新
+CREATE TABLE IF NOT EXISTS handovers (
+    handover_no TEXT PRIMARY KEY,
+    operator    TEXT NOT NULL,
+    payload     TEXT NOT NULL,
+    note        TEXT,
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+-- 交接明细:逐项保存变更前后位置;原位置以请求声明为准并经事务校验,
+-- 目标位置冗余保存以便按样品直接查询历史;触发器禁止 UPDATE/DELETE(不可变审计)
+CREATE TABLE IF NOT EXISTS handover_items (
+    item_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    handover_no   TEXT NOT NULL,
+    sample_id     TEXT NOT NULL,
+    from_location TEXT,
+    to_location   TEXT NOT NULL,
+    seq_index     INTEGER NOT NULL,
+    FOREIGN KEY (handover_no) REFERENCES handovers(handover_no),
+    FOREIGN KEY (sample_id)   REFERENCES samples(sample_id),
+    UNIQUE (handover_no, sample_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_hitems_handover ON handover_items(handover_no);
+CREATE INDEX IF NOT EXISTS idx_hitems_sample   ON handover_items(sample_id);
+
+CREATE TRIGGER IF NOT EXISTS trg_handover_no_update
+BEFORE UPDATE ON handover_items
+BEGIN
+    SELECT RAISE(ABORT, 'handover_items 不可变:禁止更新位置交接明细');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_handover_no_delete
+BEFORE DELETE ON handover_items
+BEGIN
+    SELECT RAISE(ABORT, 'handover_items 不可变:禁止删除位置交接明细');
+END;
 """
 
 

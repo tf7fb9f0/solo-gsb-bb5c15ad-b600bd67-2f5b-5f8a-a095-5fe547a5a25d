@@ -1,6 +1,6 @@
 # 科研样品分装追溯 API
 
-基于 **FastAPI + SQLite** 的科研样品谱系(lineage)追溯服务。支持样品的**取样、分装、合并、销毁/报废**四类操作,在数据库事务中完成余量(销毁按可用量)校验与环路检测,并通过唯一操作号实现**幂等提交**;可按任意样品回溯完整来源与去向,并对余量账本做一致性校验。销毁操作允许一次提交多个样品的销毁量与原因,服务在单事务内按当前可用量(余量减未释放预留)逐项校验,任一不足则整体回滚并返回逐项冲突,成功后写入不可变销毁审计记录与出库流水并递增样品版本,同时接入批量提交与 dry-run 预校验。此外提供两个扩展模块:**预留模块**——客户端可用一个预留号为多个样品分别锁定数量,服务在同一事务中校验各样品可用余量(当前余量减去未释放预留),全部足够才一次创建,支持按预留号幂等重放、整单释放与可用量查询;**盘点模块**——按样品编号集合建批保存余量/版本快照,提交实盘结果时逐项乐观锁校验数据库余量未被其他操作改变并计算系统量与实盘量差异,确认时在单事务内再次校验版本、写入盘点调整流水并更新样品余量(任一项冲突则整批不改库存),按盘点批次号支持同请求幂等重放与不同内容冲突。
+基于 **FastAPI + SQLite** 的科研样品谱系(lineage)追溯服务。支持样品的**取样、分装、合并、销毁/报废**四类操作,在数据库事务中完成余量(销毁按可用量)校验与环路检测,并通过唯一操作号实现**幂等提交**;可按任意样品回溯完整来源与去向,并对余量账本做一致性校验。销毁操作允许一次提交多个样品的销毁量与原因,服务在单事务内按当前可用量(余量减未释放预留)逐项校验,任一不足则整体回滚并返回逐项冲突,成功后写入不可变销毁审计记录与出库流水并递增样品版本,同时接入批量提交与 dry-run 预校验。此外提供三个扩展模块:**预留模块**——客户端可用一个预留号为多个样品分别锁定数量,服务在同一事务中校验各样品可用余量(当前余量减去未释放预留),全部足够才一次创建,支持按预留号幂等重放、整单释放与可用量查询;**盘点模块**——按样品编号集合建批保存余量/版本快照,提交实盘结果时逐项乐观锁校验数据库余量未被其他操作改变并计算系统量与实盘量差异,确认时在单事务内再次校验版本、写入盘点调整流水并更新样品余量(任一项冲突则整批不改库存),按盘点批次号支持同请求幂等重放与不同内容冲突;**位置交接模块**——一次提交多个样品的原位置与目标位置,服务在单个事务内校验全部样品仍处于请求所述原位置,任一不符则整批不变,全部通过后统一更新样品位置并记录交接人、交接时间与每个样品的变更前后位置(不可变审计),支持按交接单号幂等重放,并提供按样品查询完整交接历史的接口。
 
 ## 一键启动
 
@@ -49,6 +49,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 盘点批次 | 一个盘点批次号(`stocktake_no`)对应一次盘点,状态机 `open`(已建批快照)→ `submitted`(已提交实盘与差异)→ `confirmed`(已确认调账) |
 | 盘点快照 / 差异 | 建批时在事务内逐项保存系统余量、单位与版本;提交实盘时计算 **差异 = 实盘量 − 系统量** |
 | 盘点调整流水 | 确认时逐项写入 `stocktake_adjustments`(系统量、实盘量、调整量、操作者、原因、前后版本),是余量账本的一部分 |
+| 位置交接单 | 一次提交多个样品的**原位置 `from_location` 与目标位置 `to_location`**;`handover_no` 为全局唯一幂等键,交接人 `operator` 必填 |
+| 交接审计明细 | 交接成功即逐项写入不可变表 `handover_items`(样品、变更前后位置、单内下标),交接人/时间记录在 `handovers` 表头;触发器禁止 UPDATE/DELETE |
 
 **事务保证**
 
@@ -81,6 +83,14 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 - **幂等**:同批次号 + 同建批请求体重放返回当前批次(`replayed: true`),同号不同内容返回 `409 stocktake_no_conflict`;已提交批次仅接受相同实盘请求体重放,否则 `409 stocktake_result_conflict`;已确认批次接受相同操作者/原因的重复确认回放,不同内容返回 `409 stocktake_already_confirmed`。
 - **数据库迁移**:旧版本数据库(无 `samples.version` 列)在启动初始化时经 `schema_migrations` 登记的迁移自动补列/补表,迁移幂等,重复启动不重复执行。
 
+**位置交接事务保证**
+
+- 交接请求一次给出多个样品明细,每项声明该样品**当前所在原位置 `from_location`**(可为 `null`,表示样品当前无位置)与**目标位置 `to_location`**;交接人 `operator` 必填。
+- 服务在单个 `BEGIN IMMEDIATE` 事务内逐项校验:样品存在、原位置与目标位置不同(否则 `same_location`)、且样品数据库当前位置与请求声明的原位置完全一致(不一致即 `location_mismatch`,响应带声明位置 `location` 与实际位置 `current_location`)。**任一项不符即整批回滚,任何样品的位置都不变**,响应 `conflicts[]` 一次返回全部问题明细。
+- 全部通过后才统一 `UPDATE` 各样品位置,并写交接单 `handovers`(交接单号、交接人、时间、请求快照)与**不可变交接明细** `handover_items`(样品、变更前后位置;触发器禁止 UPDATE/DELETE)。交接只改 `samples.location`,不改动余量、版本与出入库流水。
+- **幂等**:同一交接单号 + 同一请求体重放返回首次结果(`replayed: true`,含首次交接时间),不重复改位置;同号不同内容返回 `409 handover_no_conflict`。
+- **历史**:`GET /api/v1/samples/{id}/handovers` 按交接时间先后返回该样品的全部交接记录(交接单号、交接人、时间、变更前后位置)与查询时刻的当前位置;样品不存在返回 `409 sample_not_found`,从未交接过则返回空列表。
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
@@ -105,6 +115,9 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/api/v1/stocktakes/{no}/submit` | 提交实盘结果:逐项校验样品仍存在且余量未被改变,计算系统量与实盘量差异 |
 | POST | `/api/v1/stocktakes/{no}/confirm` | 确认盘点:事务内二次校验版本,写调整流水并更新余量(任一冲突整批不改) |
 | GET  | `/api/v1/stocktakes/{no}` | 查询盘点批次:快照、实盘/差异、当前版本漂移、确认状态与调整流水 |
+| POST | `/api/v1/handovers` | 位置交接:一次提交多个样品的原位置与目标位置,单事务全部校验通过才统一更新(按交接单号幂等) |
+| GET  | `/api/v1/handovers/{handover_no}` | 按交接单号查询交接结果(含交接人、时间与逐项变更前后位置) |
+| GET  | `/api/v1/samples/{id}/handovers` | 按样品查询位置交接历史(交接人、时间、变更前后位置) |
 | GET  | `/api/v1/operations/{op_no}` | 按操作号取首次提交的原始结果(幂等凭证) |
 | GET  | `/health` | 健康检查 |
 
@@ -402,6 +415,64 @@ curl -X POST http://localhost:8000/api/v1/operations/dispose \
 
 任一样品可用量不足(或不存在)时返回 `409`,`conflicts[]` 中**一次列出全部问题明细**(可含多条 `insufficient_available` 与 `sample_not_found`),整单回滚、余量与审计均不变。同一操作号用相同请求体重放返回首次结果且 `replayed: true`;同号不同内容返回 `409 op_no_conflict`。销毁同样支持 `/api/v1/batch`(可与取样/分装/合并混批,任一冲突整批回滚)、`/api/v1/validate` 与 `/api/v1/batch/validate`(不写库,冲突带 `batch_index`)。销毁后 `/api/v1/checks/balances` 仍为一致(销毁量计入各样品 `total_out`)。
 
+### 13. 位置交接:多样品原位置 → 目标位置(单事务)
+
+一次提交多个样品,逐项声明**原位置**与**目标位置**;服务在单事务内确认每个样品仍处于原位置后统一改位:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/handovers \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "handover_no": "HO-20260923-001",
+    "operator": "李交接",
+    "note": "冷链转运至实验楼B",
+    "items": [
+      {"sample_id": "S0", "from_location": "冷库A-1", "to_location": "实验楼B-冰柜2"},
+      {"sample_id": "A2", "from_location": "冷库A-1", "to_location": "实验楼B-冰柜2"}
+    ]
+  }'
+```
+
+全部样品当前位置与 `from_location` 一致时才提交,响应返回交接人、交接时间与逐项变更前后位置:
+
+```json
+{
+  "handover_no": "HO-20260923-001",
+  "operator": "李交接",
+  "note": "冷链转运至实验楼B",
+  "items": [
+    {"sample_id": "S0", "from_location": "冷库A-1", "to_location": "实验楼B-冰柜2"},
+    {"sample_id": "A2", "from_location": "冷库A-1", "to_location": "实验楼B-冰柜2"}
+  ],
+  "replayed": false,
+  "created_at": "2026-09-23T10:26:38.425Z"
+}
+```
+
+任一样品已不在声明的原位置(或不存在、原位置与目标位置相同)时返回 `409`,`conflicts[]` 一次列出全部问题明细(冲突项附声明位置 `location` 与数据库实际位置 `current_location`),**整批回滚,所有样品位置保持不变**。样品当前无位置时以 `"from_location": null` 声明。相同交接单号 + 相同请求体重放返回首次结果且 `replayed: true`;同号不同内容返回 `409 handover_no_conflict`。
+
+**按样品查询交接历史**:
+
+```bash
+curl http://localhost:8000/api/v1/samples/S0/handovers
+```
+
+```json
+{
+  "sample_id": "S0",
+  "current_location": "实验楼B-冰柜2",
+  "total": 1,
+  "items": [
+    {"handover_no": "HO-20260923-001", "operator": "李交接",
+     "note": "冷链转运至实验楼B", "sample_id": "S0",
+     "from_location": "冷库A-1", "to_location": "实验楼B-冰柜2",
+     "seq_index": 0, "created_at": "2026-09-23T10:26:38.425Z"}
+  ]
+}
+```
+
+多次交接的样品会按时间先后返回全部记录;从未交接过的样品 `items` 为空。也可用 `GET /api/v1/handovers/HO-20260923-001` 按交接单号取回整单(幂等凭证);交接明细不可修改或删除(数据库触发器兜底)。
+
 ## 冲突码
 
 | code | 含义 |
@@ -429,6 +500,10 @@ curl -X POST http://localhost:8000/api/v1/operations/dispose \
 | `stocktake_closed` | 批次已确认,不能再次提交实盘结果 |
 | `stocktake_already_confirmed` | 批次已确认且操作者/原因与本次确认请求不同 |
 | `stocktake_not_found` | 盘点批次不存在(查询/提交/确认时返回 HTTP 404) |
+| `location_mismatch` | 样品当前位置与请求声明的原位置不一致,附声明位置 `location` 与实际位置 `current_location` |
+| `same_location` | 交接明细的原位置与目标位置相同,无需交接 |
+| `handover_no_conflict` | 交接单号已存在但请求内容不同(幂等键冲突) |
+| `handover_not_found` | 交接单号不存在(按单号查询时返回 HTTP 404) |
 
 ## 运行测试
 
@@ -442,17 +517,19 @@ python -m pytest -q
 ```
 app/
   config.py        # 数据库路径、容差等配置
-  db.py            # SQLite 连接 / 建表 / 增量迁移(WAL、外键、CHECK 约束、预留/盘点/销毁表)
-  schemas.py       # Pydantic 请求与响应模型(含冲突结构、预留、盘点与销毁模型)
+  db.py            # SQLite 连接 / 建表 / 增量迁移(WAL、外键、CHECK 约束、预留/盘点/销毁/交接表)
+  schemas.py       # Pydantic 请求与响应模型(含冲突结构、预留、盘点、销毁与位置交接模型)
   service.py       # 核心:事务提交、余量/可用量/环路校验、销毁审计、幂等回放、dry-run、递归回溯、账本审计
   reservations.py  # 预留:单事务多样品锁定、幂等重放、整单释放、可用量查询、事件审计
   stocktakes.py    # 盘点:快照建批、提交版本校验与差异、确认二次校验后整批原子调账
+  handovers.py     # 位置交接:单事务校验全部样品仍在原位置、统一改位并记录交接人/时间/前后位置、按样品查历史
   main.py          # FastAPI 路由
 tests/
   test_api.py          # 操作链路端到端测试(TestClient)
   test_disposals.py    # 销毁/报废:可用量校验、整单回滚、不可变审计、幂等、批量与 dry-run
   test_reservations.py # 预留模块端到端/并发/审计测试
   test_stocktakes.py   # 盘点工作流端到端/并发确认/旧库迁移测试
+  test_handovers.py    # 位置交接:原位置校验、整批回滚、幂等、不可变审计、按样品历史、并发
 Dockerfile
 docker-compose.yml
 ```
