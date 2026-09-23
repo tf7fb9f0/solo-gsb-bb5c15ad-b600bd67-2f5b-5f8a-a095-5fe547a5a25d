@@ -13,6 +13,7 @@ from . import schemas as s
 from . import reservations as rsv
 from . import service
 from . import stocktakes as st
+from . import transfers as tr
 from .config import BALANCE_TOLERANCE, DB_PATH
 from .db import connect, get_conn, init_db
 
@@ -45,9 +46,13 @@ app = FastAPI(
         "- 盘点模块:按样品编号集合建批保存余量/版本快照,\n"
         "  提交实盘时乐观锁校验余量未被改变并计算差异,\n"
         "  确认时单事务二次校验版本、写盘点调整流水并更新余量\n"
-        "  (任一项冲突整批不改库存),按批次号幂等重放"
+        "  (任一项冲突整批不改库存),按批次号幂等重放\n"
+        "- 位置交接:一次提交多个样品的原位置与目标位置,\n"
+        "  单事务校验全部样品仍处于请求所述原位置,任一不符整批不变,\n"
+        "  全部通过后统一更新位置并记录交接人、时间与变更前后位置,\n"
+        "  支持按样品查询交接历史,按交接单号幂等重放"
     ),
-    version="1.1.0",
+    version="1.2.0",
     lifespan=lifespan,
 )
 
@@ -88,6 +93,19 @@ async def stocktake_error_handler(
         status_code=status_code,
         content={
             "error": "stocktake_not_found" if status_code == 404 else "conflict",
+            "conflicts": [c.model_dump() for c in exc.conflicts],
+        },
+    )
+
+
+@app.exception_handler(tr.TransferError)
+async def transfer_error_handler(
+    _request, exc: tr.TransferError
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=409,
+        content={
+            "error": "conflict",
             "conflicts": [c.model_dump() for c in exc.conflicts],
         },
     )
@@ -475,3 +493,42 @@ def get_stocktake(
     conn: sqlite3.Connection = Depends(get_conn),
 ) -> s.StocktakeResponse:
     return st.get_stocktake(conn, stocktake_no)
+
+
+# ---------------------------------------------------------------- 位置交接
+
+@app.post(
+    "/api/v1/transfers",
+    response_model=s.LocationTransferResult,
+    tags=["位置交接"],
+    summary="位置交接:一次提交多个样品的原位置与目标位置,"
+            "单事务校验全部样品仍处于原位置,任一不符整批不变",
+)
+def create_transfer(
+    body: s.LocationTransferRequest,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> s.LocationTransferResult:
+    return tr.create_transfer(conn, body)
+
+
+@app.get(
+    "/api/v1/samples/{sample_id}/transfers",
+    response_model=s.LocationHistoryResponse,
+    tags=["位置交接"],
+    summary="按样品查询位置交接历史(交接人、时间、变更前后位置,最新在前)",
+)
+def get_transfer_history(
+    sample_id: str,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> s.LocationHistoryResponse:
+    if conn.execute(
+        "SELECT 1 FROM samples WHERE sample_id = ?", (sample_id,)
+    ).fetchone() is None:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error": "not_found",
+                "message": f"样品 {sample_id} 不存在",
+            },
+        )
+    return tr.get_history(conn, sample_id)

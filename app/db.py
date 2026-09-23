@@ -210,6 +210,57 @@ BEFORE DELETE ON dispose_records
 BEGIN
     SELECT RAISE(ABORT, 'dispose_records 不可变:禁止删除销毁审计记录');
 END;
+
+-- 位置交接单:一次提交多个样品的原位置 -> 目标位置;
+-- transfer_no 为幂等键,单事务内逐项校验样品仍处于请求所述原位置
+CREATE TABLE IF NOT EXISTS location_transfers (
+    transfer_no TEXT PRIMARY KEY,
+    operator    TEXT NOT NULL,
+    payload     TEXT NOT NULL,
+    note        TEXT,
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+-- 位置交接明细:逐项记录变更前后位置,随交接单单事务写入,触发器禁止 UPDATE/DELETE
+CREATE TABLE IF NOT EXISTS location_transfer_items (
+    item_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    transfer_no   TEXT NOT NULL,
+    sample_id     TEXT NOT NULL,
+    seq_index     INTEGER NOT NULL,
+    from_location TEXT,
+    to_location   TEXT NOT NULL,
+    operator      TEXT NOT NULL,
+    created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    FOREIGN KEY (transfer_no) REFERENCES location_transfers(transfer_no),
+    FOREIGN KEY (sample_id)   REFERENCES samples(sample_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ltransfer_no     ON location_transfer_items(transfer_no);
+CREATE INDEX IF NOT EXISTS idx_ltransfer_sample ON location_transfer_items(sample_id);
+
+CREATE TRIGGER IF NOT EXISTS trg_ltransfer_hdr_no_update
+BEFORE UPDATE ON location_transfers
+BEGIN
+    SELECT RAISE(ABORT, 'location_transfers 不可变:禁止更新位置交接单');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_ltransfer_hdr_no_delete
+BEFORE DELETE ON location_transfers
+BEGIN
+    SELECT RAISE(ABORT, 'location_transfers 不可变:禁止删除位置交接单');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_ltransfer_no_update
+BEFORE UPDATE ON location_transfer_items
+BEGIN
+    SELECT RAISE(ABORT, 'location_transfer_items 不可变:禁止更新位置交接明细');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_ltransfer_no_delete
+BEFORE DELETE ON location_transfer_items
+BEGIN
+    SELECT RAISE(ABORT, 'location_transfer_items 不可变:禁止删除位置交接明细');
+END;
 """
 
 

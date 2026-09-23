@@ -120,6 +120,12 @@ class Conflict(BaseModel):
     requested: Optional[float] = None
     available: Optional[float] = None
     cycle_path: Optional[list[str]] = Field(default=None, description="检测到的环路节点路径")
+    requested_location: Optional[str] = Field(
+        default=None, description="位置交接冲突:请求所述的原位置"
+    )
+    available_location: Optional[str] = Field(
+        default=None, description="位置交接冲突:样品当前实际位置"
+    )
 
 
 class EdgeOut(BaseModel):
@@ -409,3 +415,67 @@ class StocktakeResponse(BaseModel):
     created_at: Optional[str] = None
     submitted_at: Optional[str] = None
     confirmed_at: Optional[str] = None
+
+
+# ---------------------------------------------------------------- 位置交接
+
+class LocationTransferItemIn(BaseModel):
+    """位置交接明细:声明样品当前所在的原位置,并给出要移往的目标位置。"""
+
+    sample_id: str = Field(min_length=1)
+    from_location: Optional[str] = Field(
+        default=None, description="请求所述原位置(样品当前必须在此位置),null 表示样品未登记位置"
+    )
+    to_location: str = Field(min_length=1, description="交接目标位置")
+
+
+class LocationTransferRequest(BaseModel):
+    """一次提交多个样品的位置交接:单事务校验全部样品仍处于原位置,
+    任一不符则整批不变;同交接号同内容幂等重放,同号不同内容 409。"""
+
+    transfer_no: str = Field(min_length=1, description="交接单号(幂等键),全局唯一")
+    operator: str = Field(min_length=1, description="交接人(审计必填)")
+    items: list[LocationTransferItemIn] = Field(min_length=1)
+    note: Optional[str] = Field(default=None, description="备注,仅用于审计展示")
+
+    @model_validator(mode="after")
+    def _check_items(self) -> "LocationTransferRequest":
+        ids = [i.sample_id for i in self.items]
+        if len(ids) != len(set(ids)):
+            raise ValueError("items 中存在重复 sample_id")
+        return self
+
+
+class LocationTransferItemOut(BaseModel):
+    sample_id: str
+    from_location: Optional[str] = Field(description="变更前位置(实际校验通过的原位置)")
+    to_location: str = Field(description="变更后位置")
+
+
+class LocationTransferResult(BaseModel):
+    transfer_no: str
+    operator: str = Field(description="交接人")
+    note: Optional[str] = None
+    items: list[LocationTransferItemOut] = Field(description="逐项变更前后位置")
+    handover_at: str = Field(description="交接时间(首次提交落库时间,UTC)")
+    replayed: bool = Field(
+        default=False, description="True 表示命中交接单号幂等,返回首次结果"
+    )
+    created_at: Optional[str] = None
+
+
+class LocationHistoryItem(BaseModel):
+    transfer_no: str
+    operator: str = Field(description="交接人")
+    note: Optional[str] = None
+    from_location: Optional[str] = Field(description="变更前位置")
+    to_location: str = Field(description="变更后位置")
+    handover_at: str = Field(description="交接时间(UTC)")
+
+
+class LocationHistoryResponse(BaseModel):
+    sample_id: str
+    current_location: Optional[str] = Field(description="样品当前所在位置")
+    history: list[LocationHistoryItem] = Field(
+        description="按交接时间倒序(最新在前)的位置交接历史"
+    )

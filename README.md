@@ -1,6 +1,6 @@
 # 科研样品分装追溯 API
 
-基于 **FastAPI + SQLite** 的科研样品谱系(lineage)追溯服务。支持样品的**取样、分装、合并、销毁/报废**四类操作,在数据库事务中完成余量(销毁按可用量)校验与环路检测,并通过唯一操作号实现**幂等提交**;可按任意样品回溯完整来源与去向,并对余量账本做一致性校验。销毁操作允许一次提交多个样品的销毁量与原因,服务在单事务内按当前可用量(余量减未释放预留)逐项校验,任一不足则整体回滚并返回逐项冲突,成功后写入不可变销毁审计记录与出库流水并递增样品版本,同时接入批量提交与 dry-run 预校验。此外提供两个扩展模块:**预留模块**——客户端可用一个预留号为多个样品分别锁定数量,服务在同一事务中校验各样品可用余量(当前余量减去未释放预留),全部足够才一次创建,支持按预留号幂等重放、整单释放与可用量查询;**盘点模块**——按样品编号集合建批保存余量/版本快照,提交实盘结果时逐项乐观锁校验数据库余量未被其他操作改变并计算系统量与实盘量差异,确认时在单事务内再次校验版本、写入盘点调整流水并更新样品余量(任一项冲突则整批不改库存),按盘点批次号支持同请求幂等重放与不同内容冲突。
+基于 **FastAPI + SQLite** 的科研样品谱系(lineage)追溯服务。支持样品的**取样、分装、合并、销毁/报废**四类操作,在数据库事务中完成余量(销毁按可用量)校验与环路检测,并通过唯一操作号实现**幂等提交**;可按任意样品回溯完整来源与去向,并对余量账本做一致性校验。销毁操作允许一次提交多个样品的销毁量与原因,服务在单事务内按当前可用量(余量减未释放预留)逐项校验,任一不足则整体回滚并返回逐项冲突,成功后写入不可变销毁审计记录与出库流水并递增样品版本,同时接入批量提交与 dry-run 预校验。此外提供三个扩展模块:**预留模块**——客户端可用一个预留号为多个样品分别锁定数量,服务在同一事务中校验各样品可用余量(当前余量减去未释放预留),全部足够才一次创建,支持按预留号幂等重放、整单释放与可用量查询;**盘点模块**——按样品编号集合建批保存余量/版本快照,提交实盘结果时逐项乐观锁校验数据库余量未被其他操作改变并计算系统量与实盘量差异,确认时在单事务内再次校验版本、写入盘点调整流水并更新样品余量(任一项冲突则整批不改库存),按盘点批次号支持同请求幂等重放与不同内容冲突;**位置交接模块**——一次提交多个样品的原位置与目标位置,服务在单个 `BEGIN IMMEDIATE` 事务内逐项校验样品仍处于请求所述原位置,任一不符(样品不存在或已被移动)则整批不变,全部通过后统一更新各样品位置并逐项记录交接人、交接时间与变更前后位置(审计表不可变),同时提供按样品查询交接历史的接口,交接按交接单号幂等重放。
 
 ## 一键启动
 
@@ -49,6 +49,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 盘点批次 | 一个盘点批次号(`stocktake_no`)对应一次盘点,状态机 `open`(已建批快照)→ `submitted`(已提交实盘与差异)→ `confirmed`(已确认调账) |
 | 盘点快照 / 差异 | 建批时在事务内逐项保存系统余量、单位与版本;提交实盘时计算 **差异 = 实盘量 − 系统量** |
 | 盘点调整流水 | 确认时逐项写入 `stocktake_adjustments`(系统量、实盘量、调整量、操作者、原因、前后版本),是余量账本的一部分 |
+| 位置交接单 | 一个交接单号(`transfer_no`)对应一次多位置交接;逐项给出样品的**原位置**与**目标位置**,交接人必填 |
+| 位置交接审计 | 交接成功后逐项写入不可变表 `location_transfer_items`(样品、变更前/后位置、交接人、交接时间),头表与明细表触发器均禁止 UPDATE/DELETE |
 
 **事务保证**
 
@@ -81,6 +83,14 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 - **幂等**:同批次号 + 同建批请求体重放返回当前批次(`replayed: true`),同号不同内容返回 `409 stocktake_no_conflict`;已提交批次仅接受相同实盘请求体重放,否则 `409 stocktake_result_conflict`;已确认批次接受相同操作者/原因的重复确认回放,不同内容返回 `409 stocktake_already_confirmed`。
 - **数据库迁移**:旧版本数据库(无 `samples.version` 列)在启动初始化时经 `schema_migrations` 登记的迁移自动补列/补表,迁移幂等,重复启动不重复执行。
 
+**位置交接事务保证**
+
+- 交接请求一次给出多个样品明细,每项声明**请求所述原位置 `from_location`** 与**目标位置 `to_location`**(目标位置必填;原位置传 `null` 表示样品未登记位置)。服务在单个 `BEGIN IMMEDIATE` 事务内逐项校验样品存在且当前位置与 `from_location` 完全一致;**任一项不符(样品不存在或已被其他交接/操作移动)即整批回滚**,响应 `conflicts[]` 一次返回全部不符明细(冲突体带 `requested_location` 请求原位置与 `available_location` 当前实际位置),**所有样品位置保持不变**。
+- 全部校验通过后才统一更新各样品 `samples.location`,并在同一事务内写交接单头 `location_transfers` 与逐项审计明细 `location_transfer_items`(交接人、交接时间、变更前位置、变更后位置);两张表均由触发器禁止 UPDATE/DELETE,交接记录不可变。
+- 交接只改位置,**不改动余量、不产生谱系边与出入库流水**,交接后 `/api/v1/checks/balances` 仍保持一致。
+- **幂等**:同一交接单号 + 同一请求体重放返回首次结果(`replayed: true`,返回首次交接时间),不重复移动、不重复写审计;即使重放时样品已不在原位置,也只回放原结果而不会再次移动;同号不同内容返回 `409 transfer_no_conflict`。
+- **历史查询**:`GET /api/v1/samples/{sample_id}/transfers` 返回样品当前位置与按交接时间倒序(最新在前)的交接历史;样品不存在返回 HTTP `404`。新表随容器启动时的数据库初始化自动创建,旧版本数据库无需手工迁移。
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
@@ -105,6 +115,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/api/v1/stocktakes/{no}/submit` | 提交实盘结果:逐项校验样品仍存在且余量未被改变,计算系统量与实盘量差异 |
 | POST | `/api/v1/stocktakes/{no}/confirm` | 确认盘点:事务内二次校验版本,写调整流水并更新余量(任一冲突整批不改) |
 | GET  | `/api/v1/stocktakes/{no}` | 查询盘点批次:快照、实盘/差异、当前版本漂移、确认状态与调整流水 |
+| POST | `/api/v1/transfers` | 位置交接:一次提交多个样品的原位置/目标位置,单事务校验全部仍在原位置,任一不符整批不变 |
+| GET  | `/api/v1/samples/{id}/transfers` | 按样品查询位置交接历史(交接人、时间、变更前后位置,最新在前) |
 | GET  | `/api/v1/operations/{op_no}` | 按操作号取首次提交的原始结果(幂等凭证) |
 | GET  | `/health` | 健康检查 |
 
@@ -402,6 +414,79 @@ curl -X POST http://localhost:8000/api/v1/operations/dispose \
 
 任一样品可用量不足(或不存在)时返回 `409`,`conflicts[]` 中**一次列出全部问题明细**(可含多条 `insufficient_available` 与 `sample_not_found`),整单回滚、余量与审计均不变。同一操作号用相同请求体重放返回首次结果且 `replayed: true`;同号不同内容返回 `409 op_no_conflict`。销毁同样支持 `/api/v1/batch`(可与取样/分装/合并混批,任一冲突整批回滚)、`/api/v1/validate` 与 `/api/v1/batch/validate`(不写库,冲突带 `batch_index`)。销毁后 `/api/v1/checks/balances` 仍为一致(销毁量计入各样品 `total_out`)。
 
+### 13. 位置交接:多样品原位置校验、整批原子移动
+
+一次提交多个样品的原位置与目标位置(交接人必填)。服务在**单个事务**内逐项校验样品仍处于请求所述原位置:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/transfers \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "transfer_no": "TRF-20260923-001",
+    "operator": "周八",
+    "note": "冷库A搬迁至冷库B",
+    "items": [
+      {"sample_id": "S0", "from_location": "冷库A-1", "to_location": "冷库B-1"},
+      {"sample_id": "A1", "from_location": "冷库A-2", "to_location": "冷库B-2"}
+    ]
+  }'
+```
+
+全部样品都仍在声明的原位置时才提交:统一更新各样品位置并逐项记录交接人、交接时间与变更前后位置:
+
+```json
+{
+  "transfer_no": "TRF-20260923-001",
+  "operator": "周八",
+  "note": "冷库A搬迁至冷库B",
+  "items": [
+    {"sample_id": "S0", "from_location": "冷库A-1", "to_location": "冷库B-1"},
+    {"sample_id": "A1", "from_location": "冷库A-2", "to_location": "冷库B-2"}
+  ],
+  "handover_at": "2026-09-23T02:10:33.518Z",
+  "replayed": false
+}
+```
+
+若其中某样品已被其他交接移动(或不存在),返回 `409 location_mismatch`(或 `sample_not_found`),冲突体同时给出请求原位置 `requested_location` 与样品当前实际位置 `available_location`;**整批回滚,同批次内其他样品的位置也一律不动**,且不写任何交接记录:
+
+```json
+{
+  "error": "conflict",
+  "conflicts": [{
+    "code": "location_mismatch",
+    "message": "样品 A1 当前实际位置「冷库B-2」与请求所述原位置「冷库A-2」不符,整批拒绝交接",
+    "op_no": "TRF-20260923-002",
+    "sample_id": "A1",
+    "requested_location": "冷库A-2",
+    "available_location": "冷库B-2"
+  }]
+}
+```
+
+同一交接单号用**完全相同**的请求体重放返回首次结果且 `replayed: true`(即使样品此后又被移动,也只回放原结果、不会再次移动);同号不同内容返回 `409 transfer_no_conflict`。
+
+**按样品查询交接历史**(最新在前,并给出样品当前位置):
+
+```bash
+curl http://localhost:8000/api/v1/samples/S0/transfers
+```
+
+```json
+{
+  "sample_id": "S0",
+  "current_location": "冷库B-1",
+  "history": [
+    {"transfer_no": "TRF-20260923-001", "operator": "周八",
+     "note": "冷库A搬迁至冷库B",
+     "from_location": "冷库A-1", "to_location": "冷库B-1",
+     "handover_at": "2026-09-23T02:10:33.518Z"}
+  ]
+}
+```
+
+样品不存在时该历史接口返回 HTTP `404`。交接只改位置、不动余量,交接后 `/api/v1/checks/balances` 仍保持一致;交接审计写入不可变表 `location_transfers` / `location_transfer_items`,新表随容器启动自动创建,数据保存在 Docker 卷 `sample-data` 中。
+
 ## 冲突码
 
 | code | 含义 |
@@ -429,6 +514,8 @@ curl -X POST http://localhost:8000/api/v1/operations/dispose \
 | `stocktake_closed` | 批次已确认,不能再次提交实盘结果 |
 | `stocktake_already_confirmed` | 批次已确认且操作者/原因与本次确认请求不同 |
 | `stocktake_not_found` | 盘点批次不存在(查询/提交/确认时返回 HTTP 404) |
+| `location_mismatch` | 样品当前实际位置与请求所述原位置不符,附 `requested_location`/`available_location` |
+| `transfer_no_conflict` | 交接单号已存在但请求内容不同(幂等键冲突) |
 
 ## 运行测试
 
@@ -442,17 +529,19 @@ python -m pytest -q
 ```
 app/
   config.py        # 数据库路径、容差等配置
-  db.py            # SQLite 连接 / 建表 / 增量迁移(WAL、外键、CHECK 约束、预留/盘点/销毁表)
-  schemas.py       # Pydantic 请求与响应模型(含冲突结构、预留、盘点与销毁模型)
+  db.py            # SQLite 连接 / 建表 / 增量迁移(WAL、外键、CHECK 约束、预留/盘点/销毁/位置交接表)
+  schemas.py       # Pydantic 请求与响应模型(含冲突结构、预留、盘点、销毁与位置交接模型)
   service.py       # 核心:事务提交、余量/可用量/环路校验、销毁审计、幂等回放、dry-run、递归回溯、账本审计
   reservations.py  # 预留:单事务多样品锁定、幂等重放、整单释放、可用量查询、事件审计
   stocktakes.py    # 盘点:快照建批、提交版本校验与差异、确认二次校验后整批原子调账
+  transfers.py     # 位置交接:单事务多样品原位置校验、整批原子移动、不可变审计、幂等重放、按样品查历史
   main.py          # FastAPI 路由
 tests/
   test_api.py          # 操作链路端到端测试(TestClient)
   test_disposals.py    # 销毁/报废:可用量校验、整单回滚、不可变审计、幂等、批量与 dry-run
   test_reservations.py # 预留模块端到端/并发/审计测试
   test_stocktakes.py   # 盘点工作流端到端/并发确认/旧库迁移测试
+  test_transfers.py    # 位置交接:原位置校验整批回滚、幂等、历史查询、并发串行化、不可变审计、旧库建表
 Dockerfile
 docker-compose.yml
 ```
